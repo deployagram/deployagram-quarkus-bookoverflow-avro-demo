@@ -2,6 +2,9 @@ package com.deployagram.demo.quarkus;
 
 import com.deployagram.demo.quarkus.avro.BookSuggestionMessage;
 import com.deployagram.demo.quarkus.avro.DontForgetMessage;
+import com.github.deployagram.annotations.junit5.Deployagram;
+import com.github.deployagram.annotations.junit5.DeployagramConfig;
+import com.github.deployagram.annotations.junit5.DeployagramConfigEntry;
 import com.github.tomakehurst.wiremock.client.WireMock;
 import io.confluent.kafka.serializers.KafkaAvroDeserializer;
 import io.confluent.kafka.serializers.KafkaAvroDeserializerConfig;
@@ -32,10 +35,20 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 @QuarkusTest
 @QuarkusTestResource(KafkaSchemaRegistryResource.class)
 @ConnectWireMock
+@Deployagram(startEnvironment = true, shareHostPorts = {BookOverflowResourceTest.QUARKUS_APP_PORT, BookOverflowResourceTest.WIREMOCK_PORT}, proxyPort = BookOverflowResourceTest.PROXY_PORT)
+@DeployagramConfig({
+        @DeployagramConfigEntry(key = "proxy.namesOfSourceApps.BookOverflow/suggestion", value = "AppA"),
+        @DeployagramConfigEntry(key = "proxy.proxiedAppNames.BookOverflow/suggestion", value = "BookOverflow"),
+        @DeployagramConfigEntry(key = "proxy.proxiedApps.BookOverflow/suggestion", value = "http://host.testcontainers.internal:" + BookOverflowResourceTest.QUARKUS_APP_PORT + "/BookOverflow/suggestion"),
+        @DeployagramConfigEntry(key = "proxy.namesOfSourceApps.ClassicBooks/random", value = "BookOverflow"),
+        @DeployagramConfigEntry(key = "proxy.proxiedAppNames.ClassicBooks/random", value = "ClassicBooks"),
+        @DeployagramConfigEntry(key = "proxy.proxiedApps.ClassicBooks/random", value = "http://host.testcontainers.internal:" + BookOverflowResourceTest.WIREMOCK_PORT + "/ClassicBooks/random"),
+})
 class BookOverflowResourceTest {
 
     protected static final int QUARKUS_APP_PORT = 8081;
     protected static final int WIREMOCK_PORT = 9050;
+    protected static final int PROXY_PORT = 9080;
 
     private static final String EMAIL_ADDRESS = "test@deployagram.com";
     private static final String SUGGESTIONS_TOPIC = "SuppliedSuggestionsTopic";
@@ -69,7 +82,7 @@ class BookOverflowResourceTest {
                         .withBody(expectedRecommendation)));
 
         String body = given()
-                .port(QUARKUS_APP_PORT)
+                .port(PROXY_PORT)
                 .queryParam("email", EMAIL_ADDRESS)
                 .when().get("/BookOverflow/suggestion")
                 .then()
@@ -89,22 +102,22 @@ class BookOverflowResourceTest {
             consumer.subscribe(List.of(SUGGESTIONS_TOPIC));
 
             Awaitility.await()
-                    .atMost(Duration.ofSeconds(10))
-                    .pollInterval(Duration.ofMillis(100))
-                    .untilAsserted(() -> {
-                        consumer.poll(Duration.ofMillis(500)).forEach(receivedRecords::add);
-                        assertEquals(1, receivedRecords.size());
+                      .atMost(Duration.ofSeconds(10))
+                      .pollInterval(Duration.ofMillis(100))
+                      .untilAsserted(() -> {
+                          consumer.poll(Duration.ofMillis(500)).forEach(receivedRecords::add);
+                          assertEquals(1, receivedRecords.size());
 
-                        ConsumerRecord<String, DontForgetMessage> record = receivedRecords.get(0);
-                        assertNotNull(record.value());
+                          ConsumerRecord<String, DontForgetMessage> record = receivedRecords.get(0);
+                          assertNotNull(record.value());
 
-                        DontForgetMessage dontForget = record.value();
-                        assertEquals(EMAIL_ADDRESS, dontForget.getEmail().toString());
-                        BookSuggestionMessage suggestion = dontForget.getSuggestion();
-                        assertEquals("Refactoring", suggestion.getName().toString());
-                        assertEquals("1st", suggestion.getEdition().toString());
-                        assertEquals("paperback", suggestion.getFormat().toString());
-                    });
+                          DontForgetMessage dontForget = record.value();
+                          assertEquals(EMAIL_ADDRESS, dontForget.getEmail().toString());
+                          BookSuggestionMessage suggestion = dontForget.getSuggestion();
+                          assertEquals("Refactoring", suggestion.getName().toString());
+                          assertEquals("1st", suggestion.getEdition().toString());
+                          assertEquals("paperback", suggestion.getFormat().toString());
+                      });
         }
     }
 

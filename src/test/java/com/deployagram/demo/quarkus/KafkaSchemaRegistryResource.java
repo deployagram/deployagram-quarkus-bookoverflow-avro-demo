@@ -17,6 +17,7 @@ public class KafkaSchemaRegistryResource implements QuarkusTestResourceLifecycle
     private static final DockerImageName KAFKA_IMAGE = DockerImageName.parse("confluentinc/cp-kafka:7.6.1");
     private static final DockerImageName SCHEMA_REGISTRY_IMAGE = DockerImageName.parse("confluentinc/cp-schema-registry:7.6.1");
 
+    private static final String COLLECTOR_URL = "http://localhost:1152";
     private static final String DEPLOYAGRAM_NETWORK = "deployagram";
     private static final int KAFKA_COLLECTOR_PORT = 19092;
 
@@ -33,7 +34,6 @@ public class KafkaSchemaRegistryResource implements QuarkusTestResourceLifecycle
                 .withNetworkMode(DEPLOYAGRAM_NETWORK)
                 .withCreateContainerCmdModifier(command -> command.withName(kafkaContainerName))
                 .withListener(() -> kafkaContainerName + ":" + KAFKA_COLLECTOR_PORT);
-        kafka.start();
         schemaRegistry = new GenericContainer<>(SCHEMA_REGISTRY_IMAGE)
                 .withNetworkMode(DEPLOYAGRAM_NETWORK)
                 .withCreateContainerCmdModifier(command -> command.withName(schemaRegistryContainerName))
@@ -43,19 +43,18 @@ public class KafkaSchemaRegistryResource implements QuarkusTestResourceLifecycle
                 .withEnv("SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS", kafkaBootstrapServersForCollector())
                 .waitingFor(Wait.forHttp("/subjects").forStatusCode(200).withStartupTimeout(Duration.ofSeconds(30)));
 
+        kafka.start();
         schemaRegistry.start();
 
         String schemaRegistryUrl = "http://" + schemaRegistry.getHost() + ":" + schemaRegistry.getMappedPort(8081);
+        registerKafkaWithCollector(kafkaBootstrapServersForCollector());
+        registerSchemaRegistryWithCollector(schemaRegistryUrlForCollector());
 
         return Map.of(
                 "kafka.bootstrap.servers", kafka.getBootstrapServers(),
                 "mp.messaging.connector.smallrye-kafka.bootstrap.servers", kafka.getBootstrapServers(),
                 "mp.messaging.connector.smallrye-kafka.schema.registry.url", schemaRegistryUrl
         );
-    }
-
-    private String kafkaBootstrapServersForCollector() {
-        return "PLAINTEXT://" + kafkaContainerName + ":" + KAFKA_COLLECTOR_PORT;
     }
 
     @Override
@@ -66,5 +65,35 @@ public class KafkaSchemaRegistryResource implements QuarkusTestResourceLifecycle
         if (kafka != null) {
             kafka.stop();
         }
+    }
+
+    private void registerSchemaRegistryWithCollector(String schemaRegistryUrl) {
+        given()
+                .baseUri(COLLECTOR_URL)
+                .header("Content-Type", "application/json")
+                .body("{\"url\":\"" + schemaRegistryUrl + "\"}")
+                .when()
+                .put("/schemaRegistry/configuration")
+                .then()
+                .statusCode(204);
+    }
+
+    private void registerKafkaWithCollector(String bootstrapServers) {
+        given()
+                .baseUri(COLLECTOR_URL)
+                .header("Content-Type", "application/json")
+                .body("{\"bootstrapServers\":\"" + bootstrapServers + "\"}")
+                .when()
+                .put("/kafka/configuration")
+                .then()
+                .statusCode(204);
+    }
+
+    private String kafkaBootstrapServersForCollector() {
+        return "PLAINTEXT://" + kafkaContainerName + ":" + KAFKA_COLLECTOR_PORT;
+    }
+
+    private String schemaRegistryUrlForCollector() {
+        return "http://" + schemaRegistryContainerName + ":8081";
     }
 }

@@ -24,12 +24,148 @@ jobs:
           java-version: '21'
           cache: 'maven'
 
-      # Any network will do, as long as registry can reach kafka
-      - name: Create Docker Network
+      - name: Get JWT from Cognito
+        id: jwt
+        shell: bash
+        env:
+          DEPLOYAGRAM_CLIENT_ID: ${{ secrets.DEPLOYAGRAM_CLIENT_ID }}
+          DEPLOYAGRAM_CLOUD_USERNAME: ${{ secrets.DEPLOYAGRAM_CLOUD_USERNAME }}
+          DEPLOYAGRAM_CLOUD_PASSWORD: ${{ secrets.DEPLOYAGRAM_CLOUD_PASSWORD }}
+        run: |
+          set -euo pipefail
+          JWT_TOKEN=$(aws cognito-idp initiate-auth \
+            --client-id "$DEPLOYAGRAM_CLIENT_ID" \
+            --auth-flow USER_PASSWORD_AUTH \
+            --auth-parameters USERNAME="${DEPLOYAGRAM_CLOUD_USERNAME}",PASSWORD="${DEPLOYAGRAM_CLOUD_PASSWORD}" \
+            --region "$AWS_REGION" \
+            | jq -r '.AuthenticationResult.IdToken')
+
+          if [[ -z "${JWT_TOKEN}" || "${JWT_TOKEN}" == "null" ]]; then
+            echo "Failed to obtain JWT from Cognito" >&2
+            exit 1
+          fi
+
+          echo "::add-mask::${JWT_TOKEN}"
+          echo "token=${JWT_TOKEN}" >> "$GITHUB_OUTPUT"
+
+      - name: Exchange JWT for ECR password, login and pull images
+        shell: bash
+        run: |
+          set -euo pipefail
+          PASSWORD=$(curl -sS -H "Authorization: Bearer ${{ steps.jwt.outputs.token }}" \
+            "https://jtjabaluo5.execute-api.eu-west-2.amazonaws.com/registry/token" \
+            | jq -r '.password')
+
+          if [[ -z "${PASSWORD}" || "${PASSWORD}" == "null" ]]; then
+            echo "Failed to obtain ECR password" >&2
+            exit 1
+          fi
+
+          echo "::add-mask::${PASSWORD}"
+          echo "${PASSWORD}" | docker login -u AWS --password-stdin "${ECR_REGISTRY}"
+
+          docker pull "${ECR_REGISTRY}/deployagram-docker:deployagram-collector-multi-latest"
+          docker pull "${ECR_REGISTRY}/deployagram-docker:http-diagramming-proxy-multi-latest"
+
+      - name: Create Docker Network for DEPLOYAGRAM
         run: |
           docker network create deployagram
 
+      - name: Start DEPLOYAGRAM Collector
+        env:
+          DEPLOYAGRAM_CLIENT_ID: ${{ secrets.DEPLOYAGRAM_CLIENT_ID }}
+          DEPLOYAGRAM_CLOUD_USERNAME: ${{ secrets.DEPLOYAGRAM_CLOUD_USERNAME }}
+          DEPLOYAGRAM_CLOUD_PASSWORD: ${{ secrets.DEPLOYAGRAM_CLOUD_PASSWORD }}
+          DEPLOYAGRAM_LICENSE_KEY: ${{ secrets.DEPLOYAGRAM_LICENSE_KEY }}
+          DEPLOYAGRAM_LICENSE: ${{ secrets.DEPLOYAGRAM_LICENSE }}
+        run: |
+          docker run \
+            -d \
+            --name diagram-logger \
+            --network deployagram \
+            --network-alias diagram-logger \
+            -p 1152:8080 \
+            -e DEPLOYAGRAM_CLIENT_ID="$DEPLOYAGRAM_CLIENT_ID" \
+            -e DEPLOYAGRAM_CLOUD_USERNAME="$DEPLOYAGRAM_CLOUD_USERNAME" \
+            -e DEPLOYAGRAM_CLOUD_PASSWORD="$DEPLOYAGRAM_CLOUD_PASSWORD" \
+            -e DEPLOYAGRAM_LICENSE_KEY="$DEPLOYAGRAM_LICENSE_KEY" \
+            -e DEPLOYAGRAM_LICENSE="$DEPLOYAGRAM_LICENSE" \
+            325701203566.dkr.ecr.eu-west-2.amazonaws.com/deployagram-docker:deployagram-collector-multi-latest
+
       - name: Build with Maven
+        env:
+          DEPLOYAGRAM_LICENSE_KEY: ${{ secrets.DEPLOYAGRAM_LICENSE_KEY }}
+          DEPLOYAGRAM_LICENSE: ${{ secrets.DEPLOYAGRAM_LICENSE }}
         run: ./mvnw -B clean package
 
+      - name: Push test results to DEPLOYAGRAM Cloud
+        if: ${{ success() }}
+        run: |
+          curl -v -XPOST "http://localhost:1152/run/markTestRunEnd/${CONTAINER_NAME}/${{ github.run_number }}"
+
+      - name: Run Contract Tests
+        id: contract-tests
+        env:
+          TOKEN: ${{ steps.jwt.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${TOKEN}" || "${TOKEN}" == "null" ]]; then
+            echo "❌ Missing JWT token from earlier step (steps.jwt.outputs.token)."
+            exit 1
+          fi
+
+          # Get ISO 8601 timestamp (UTC) with " z" suffix
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S z")
+
+          PAYLOAD=$(jq -n \
+            --arg container "${CONTAINER_NAME}" \
+            --arg buildId "${{ github.run_number }}" \
+            --arg environment "Prod" \
+            --arg timestamp "$TIMESTAMP" \
+            '{container: $container, buildId: $buildId, environment: $environment, timestamp: $timestamp}')
+
+          echo "Calling API for Contract Check"
+          STATUS=$(curl -s -o response.txt -w "%{http_code}" -XPOST "https://4sbxg7dfng.execute-api.eu-west-2.amazonaws.com/Prod/contract/check/container" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          echo "Status code: $STATUS"
+          echo "Response body:"
+          jq . response.txt
+
+          if [[ "$STATUS" -ne 200 ]]; then
+            echo "❌ Contract Test failed with status $STATUS"
+            exit 1
+          else
+            echo "✅ Contract Check passed"
+          fi
+
       # Insert Step here to really deploy your app to your Prod environment
+
+      - name: Inform Deployagram Cloud of Deploy to Prod
+        if: steps.contract-tests.outcome == 'success'
+        env:
+          TOKEN: ${{ steps.jwt.outputs.token }}
+        run: |
+          echo "Deploying application..."
+
+          # Get ISO 8601 timestamp (UTC) with "Z" suffix
+          DEPLOYMENT_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          VERSION="${{ github.run_number }}"  
+
+          PAYLOAD=$(jq -n \
+            --arg container "${CONTAINER_NAME}" \
+            --arg version "$VERSION" \
+            --arg environment "Prod" \
+            --arg deploymentTime "$DEPLOYMENT_TIME" \
+            '{container: $container, version: $version, environment: $environment, deploymentTime: $deploymentTime}')
+
+          echo "Calling API for Contract Check"
+          STATUS=$(curl -s -X POST "https://4sbxg7dfng.execute-api.eu-west-2.amazonaws.com/Prod/contract/deploy/container" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          echo "Deployment completed with Status: $STATUS"

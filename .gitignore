@@ -46,4 +46,6 @@ nb-configuration.xml
 
 ### Deployagram ###
 .deployagram
+.deployagram*
 .env
+.env*
